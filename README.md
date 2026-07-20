@@ -3,7 +3,7 @@ This is a project still quite underdevelopment featuring an automated trading sy
 
 ## Architecture
 *   `python_prototype/`: Python engine used mainly for building and putting together the core ideas of the SMC together with other functions.
-*   `mql5_production/`: Production-ready Expert Advisor (EA) optimized for live execution and back testing inside the MetaTrader 5 terminal.
+*   `XAU_SMC_Trader.mq5`: Production-ready Expert Advisor (EA) optimized for live execution and back testing inside the MetaTrader 5 terminal.
 
 ## Core Logic
 The system evaluates the market through a dual-timeframe structural filter:
