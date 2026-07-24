@@ -1,0 +1,200 @@
+# TRẠNG THÁI DỰ ÁN: XAU SMC TRADER BOT (MQL5)
+
+> **File:** `MEMORY.md` — Bộ nhớ dự án tĩnh. Cập nhật lần cuối: 2026-07-20 (rev 2 — bổ sung Execution Mode, Stops Level, đồng bộ tên file).
+> **Lưu ý quan trọng:** Dự án này **KHÔNG phải Python**. Toàn bộ hệ thống là **Expert Advisor (EA) chạy native trên MetaTrader 5**, viết bằng **MQL5**.
+> **Tên file chính thức duy nhất:** `XAU_SMC_Trader.mq5` — mọi tham chiếu, chỉnh sửa, ghi đè PHẢI dùng đúng tên này.
+
+---
+
+## 1. Bối cảnh & Mục tiêu dự án
+
+* **Mục tiêu:** Bot giao dịch tự động Vàng (XAUUSD) theo phương pháp **SMC (Smart Money Concepts)**, kết hợp đa khung thời gian (Multi-Timeframe).
+* **Chiến lược cốt lõi:** `H1 Order Block (POI) → chờ giá quay về vùng OB → M5 CHoCH (Change of Character) xác nhận đảo chiều → vào lệnh`.
+* **Triết lý quản trị:** Rủi ro cố định theo % balance, quản lý lệnh theo **R-multiple** (bội số rủi ro ban đầu), có cơ chế chống overtrade và "né" vùng giá vừa gây thua lỗ.
+* **Phiên bản hiện tại:** `XAU_SMC_Trader.mq5` — bản đã fix (SL buffer chuyển từ $ cố định sang ATR-based).
+
+## 2. Cấu trúc hệ thống
+
+| Hạng mục | Chi tiết |
+| --- | --- |
+| Ngôn ngữ | MQL5 (MetaQuotes Language 5), `#property strict` |
+| Nền tảng | MetaTrader 5 (EA event-driven: `OnInit`, `OnTick`, `OnTradeTransaction`, `OnDeinit`) |
+| Thư viện chuẩn | `Trade\Trade.mqh` (CTrade), `Trade\PositionInfo.mqh` (CPositionInfo), `Indicators\Indicators.mqh` |
+| Indicator | ATR H1 (period 15) & ATR M5 (period 14) qua handle `iATR` + `CopyBuffer` |
+| Symbol mục tiêu | XAUUSD (chart-attached `_Symbol`) |
+| Kiến trúc | **Monolith 1 file** — toàn bộ logic nằm trong 1 file `.mq5` |
+| Execution Mode | Hiện hard-code `ORDER_FILLING_RETURN` trong `OnInit` — **RỦI RO** với broker ECN/STP (xem 2.1) |
+
+### 2.1. Quy tắc Execution Mode (BẮT BUỘC khi refactor)
+
+XAUUSD biến động cực nhanh khi ra tin; `ORDER_FILLING_RETURN` bị nhiều broker ECN/STP từ chối → lỗi `Unsupported filling mode` / đặt lệnh thất bại. **Không được hard-code filling mode.** Quy tắc chuẩn:
+
+```mql5
+// Gọi trong OnInit() TRƯỚC khi Trade.SetTypeFilling()
+ENUM_ORDER_TYPE_FILLING GetSupportedFilling()
+{
+   long filling = SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE); // bitmask
+   if((filling & SYMBOL_FILLING_FOK) != 0) return ORDER_FILLING_FOK;
+   if((filling & SYMBOL_FILLING_IOC) != 0) return ORDER_FILLING_IOC;
+   return ORDER_FILLING_RETURN; // fallback (Exchange/Market execution)
+}
+
+```
+
+* Thứ tự ưu tiên: **FOK → IOC → RETURN** (tự dò theo bitmask của broker).
+* Kết hợp `Trade.SetDeviationInPoints(30)` để kiểm soát slippage; cân nhắc tăng deviation động theo ATR trong phiên tin mạnh, hoặc chặn entry ±X phút quanh tin (news filter — chưa có, xem Mục 5).
+
+### 2.2. Cấu trúc file & vai trò (đã thống nhất tên file)
+
+```
+project_root/
+├── MEMORY.md                         # File này — bộ nhớ dự án
+└── XAU_SMC_Trader.mq5                # EA DUY NHẤT — tên chính thức, không đổi/ghi đè nhầm
+    ├── [Inputs]                      # 6 nhóm tham số cấu hình
+    ├── [State toàn cục]              # Ticket, InitialVolume, InitialSLDistance, LossZones...
+    ├── OnInit/OnDeinit               # Khởi tạo CTrade, ATR handles / giải phóng handle
+    ├── OnTick                        # Vòng lặp chính: filter → tìm OB → tìm CHoCH → đặt lệnh
+    ├── OnTradeTransaction            # Bắt sự kiện đóng deal → đếm chuỗi thua, cooldown
+    ├── GetOB_H1()                    # Nhận diện Order Block trên H1
+    ├── DetectCHoCH_M5()              # Nhận diện CHoCH trên M5 + tính Smart SL
+    ├── IsPeak()/IsTrough()           # Swing high/low theo distance + prominence (kiểu scipy)
+    ├── ManagePosition()              # Partial close + Trailing stop theo R
+    ├── CalcLotSize()                 # Position sizing theo RiskPercent
+    ├── IsZoneBlocked()/RegisterLossZone()  # Blacklist vùng OB gây thua (ring buffer 10 slot)
+    └── IsMarketTradeable(), InCooldown(), UpdateDailyCounterIfNewDay()  # Filter phụ trợ
+
+```
+
+> **Quy ước đặt tên phiên bản:** Nếu tạo bản mới, đặt `XAU_SMC_Trader_v{N}.mq5` và cập nhật lại mục này + Mục 1. Tuyệt đối không tồn tại song song 2 tên file mơ hồ.
+
+## 3. Chi tiết logic giao dịch (SMC Core)
+
+### 3.1. Order Block H1 — `GetOB_H1()`
+
+* Quét `OB_Lookback = 100` nến H1 (từ nến index 1, bỏ nến đang chạy).
+* **Bullish OB:** Tìm nến tăng có `body > ATR(15) × 1.5` (displacement candle) → nến ngay trước đó (`i+1`) phải là **nến giảm** → vùng OB = `[low, high]` của nến giảm đó.
+* **Bearish OB:** Đối xứng — nến giảm mạnh, nến trước đó là nến tăng.
+* **Kiểm tra mitigation:** Quét từ nến OB về hiện tại; nếu có `close` phá xuyên đáy OB (bullish) / đỉnh OB (bearish) → OB **mất hiệu lực**.
+* Trả về OB **gần nhất còn hiệu lực** (return ngay khi tìm thấy đầu tiên).
+
+### 3.2. CHoCH M5 — `DetectCHoCH_M5()`
+
+Với OB Bullish (Bearish làm đối xứng):
+
+1. **Touch check:** Trong 100 nến M5, phải có ít nhất 1 nến có `low` chạm vùng OB (`bottom ≤ low ≤ top`).
+2. **Tìm swing high gần nhất:** `IsPeak()` — cao hơn `Peak_Distance = 5` nến 2 bên **và** prominence `≥ ATR(M5) × 0.5`.
+3. **Trigger CHoCH:** `close[1]` phá lên swing high và `close[2]` còn nằm dưới → breakout mới xảy ra (chống re-trigger).
+4. **Smart SL:** `lowest low` từ swing peak đến hiện tại; SL phải nằm trong/dưới OB (`lowest_low ≤ ob.top`).
+
+### 3.3. Vào lệnh & Risk (trong `OnTick`)
+
+* **Chạy theo nến M5 mới** (bar-close logic), không xử lý mỗi tick khi chưa có lệnh.
+* Filter trước entry: thị trường mở → không cooldown → chưa vượt `MaxTradesPerDay = 4` → `Spread ≤ 80 points` → OB không nằm trong blacklist loss-zone.
+* **SL** = `smart_sl ± buffer`, buffer = `ATR(M5) × 0.15` (động).
+* **TP** = `max(ob.top, entry + SL_dist × MinRR)` cho BUY (mirror cho SELL). Loại lệnh nếu RR thực tế `< MinRR = 1.5`.
+* **Lot size** = `(Balance × 1%) / (SL_points × value_per_point)`, floor theo `lot_step`, clamp min/max.
+
+#### 3.3.1. Clamp SL theo STOPS_LEVEL (BẮT BUỘC — chống "Invalid Stops")
+
+Khi giãn spread (news/rollover), khoảng cách entry → Smart SL trên M5 có thể **nhỏ hơn khoảng dừng tối thiểu** sàn cho phép → lệnh bị reject `Invalid Stops`. Quy tắc chuẩn phải áp dụng TRƯỚC khi gửi lệnh và TRƯỚC mọi `PositionModify`:
+
+```mql5
+long   stops_level_pts = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL); // points
+long   freeze_level    = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_FREEZE_LEVEL);
+double min_dist_price  = MathMax(stops_level_pts, freeze_level) * Point_val;
+
+// Clamp: SL_Distance = max(Calculated_SL_Distance, StopsLevel)
+double sl_dist = MathMax(MathAbs(entry - sl_price), min_dist_price);
+// Tính lại sl_price từ sl_dist đã clamp, rồi mới tính TP/RR/Lot từ sl_dist MỚI
+
+```
+
+* **Quan trọng:** Nếu SL bị nới ra do clamp → **phải tính lại TP và RR trên khoảng SL mới** (nếu RR mới `< MinRR` → hủy lệnh). Không được tính lot trên SL cũ.
+* Áp dụng tương tự trong `ManagePosition()`: SL trailing mới phải cách `Bid/Ask` tối thiểu `min_dist_price`, nếu không → skip lần modify đó.
+
+### 3.4. Quản lý lệnh — `ManagePosition()`
+
+* **Partial close:** Lãi `≥ 1.0R` → đóng `66%` volume (kiểm tra `lot_min`/`lot_step`).
+* **Trailing stop:** Kích hoạt từ `1.0R`, SL trail cách giá `1.0R`, chỉ modify khi cải thiện `> 0.1R` (chống spam modify). Phải tuân thủ clamp STOPS_LEVEL ở 3.3.1.
+
+### 3.5. Chống Overtrade & Loss-Zone Blacklist
+
+* **Daily cap:** Tối đa 4 lệnh/ngày (reset theo ngày lịch).
+* **Loss streak:** 2 lệnh thua liên tiếp → cooldown 12 nến H1 (profit tính gồm swap + commission trong `OnTradeTransaction`).
+* **Loss zones:** OB gây thua ghi vào ring buffer 10 slot, block re-entry 24 nến H1, proximity = `ATR(H1) × 1.0`.
+
+## 4. Luồng dữ liệu & Trạng thái hoàn thành
+
+### Luồng dữ liệu chính
+
+```
+Tick → [Có position?] ─Yes→ ManagePosition (Partial/Trailing + clamp StopsLevel)
+        │No
+        └→ New M5 bar? → Filters (session/cooldown/daily/spread)
+             → GetOB_H1 (POI) → IsZoneBlocked → DetectCHoCH_M5 (trigger + Smart SL)
+             → Clamp SL theo STOPS_LEVEL → Tính lại TP/RR → CalcLotSize
+             → Trade.Buy/Sell (filling mode tự dò theo broker)
+             → Lưu state (zone, initial risk, ticket)
+
+Deal closed → OnTradeTransaction → cập nhật loss streak / loss zone / reset state
+
+```
+
+### Trạng thái module
+
+* [x] **Data Access** — CopyBuffer/CopyHigh/Low/Open/Close, ATR handles (có check lỗi)
+* [x] **Order Block Detection (H1)** — hoàn thành, có mitigation check
+* [x] **CHoCH Detection (M5)** — hoàn thành, peak/prominence + fresh-break trigger
+* [x] **Risk Management** — % risk sizing, ATR-based SL buffer, MinRR filter
+* [x] **Position Management** — Partial close + R-based trailing
+* [x] **Overtrade Control** — daily cap, loss-streak cooldown, loss-zone blacklist
+* [x] **Execution** — CTrade với Magic, deviation 30
+* [ ] **Auto Filling Mode Detection** — CHƯA CÓ, đang hard-code `RETURN` (P0, xem 2.1)
+* [ ] **Stops Level Clamp** — CHƯA CÓ trong entry lẫn trailing (P0, xem 3.3.1)
+* [ ] **Liquidity Sweep Detection** — chưa có tường minh (mới ngầm định qua lowest-low sweep vào OB)
+* [ ] **FVG (Fair Value Gap)** — chưa có module riêng
+* [ ] **HTF Bias Filter (H4/D1)** — chưa có
+* [ ] **Session/Kill-zone Filter (London/NY)** — chỉ check symbol tradeable
+* [ ] **News Filter** — chưa có (liên quan trực tiếp slippage/spread XAU)
+* [ ] **Logging/Telemetry** — chỉ 1 `Print` khi init fail
+* [ ] **State Persistence** — loss zones / counters mất khi restart EA
+* [ ] **Unit Test / Backtest harness tự động** — chưa có
+
+## 5. Định hướng nâng cấp / Refactor tiếp theo
+
+### Ưu tiên khẩn cấp (P0 — lỗi execution thực chiến)
+
+1. **Auto-detect Filling Mode** theo `SYMBOL_FILLING_MODE` (FOK → IOC → RETURN) trong `OnInit` — chống lỗi reject lệnh trên broker ECN/STP (chi tiết 2.1).
+2. **Clamp SL/TP theo `SYMBOL_TRADE_STOPS_LEVEL` + `FREEZE_LEVEL**` ở cả entry và trailing; tính lại RR/lot sau clamp (chi tiết 3.3.1).
+3. **Persist state khi restart:** Lưu `g_LossZones`, `g_TradesToday`, `g_ConsecutiveLosses`, `InitialSLDistance` vào GlobalVariables/file — hiện restart giữa lệnh làm sai `InitialSLDistance` (fallback từ SL đã trail).
+
+### Ưu tiên cao (P1)
+
+4. **HTF Bias filter (H4):** chỉ BUY khi cấu trúc H4 bullish.
+5. **Session/Kill-zone filter:** giới hạn entry London + NY.
+6. **News filter:** chặn entry ±X phút quanh tin đỏ (NFP, CPI, FOMC) — XAU giãn spread mạnh nhất tại các mốc này.
+7. **Module hóa:** tách `SMC_OrderBlock.mqh`, `SMC_CHoCH.mqh`, `RiskManager.mqh`, `TradeManager.mqh`.
+8. **FVG confluence + Liquidity Sweep tường minh** (wick phá swing nhưng close không phá) trước khi nhận CHoCH.
+
+### Ưu tiên trung/thấp (P2)
+
+9. **Logging chuẩn:** log mọi quyết định (OB found, CHoCH trigger, lý do reject, mã retcode lệnh fail) ra file/Journal.
+10. **Breakeven step riêng** trước trailing (hiện trailing start = partial trigger = 1R).
+11. **Multi-symbol support:** bỏ phụ thuộc `_Symbol`.
+
+## 6. Quy chuẩn Code (Code Conventions)
+
+* MQL5 `#property strict`; mọi array phải `ArraySetAsSeries(arr, true)` trước khi Copy.
+* Indicator dùng **handle** (`iATR` + `CopyBuffer`), release trong `OnDeinit`.
+* Mọi lệnh gửi qua `CTrade` với `MagicNumber = 202405`; mọi filter position check cả `Symbol` + `Magic`.
+* **Execution an toàn cho XAUUSD (BẮT BUỘC):**
+* KHÔNG hard-code filling mode — luôn dò `SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE)` rồi mới `Trade.SetTypeFilling()` (ưu tiên FOK → IOC → RETURN).
+* MỌI giá SL/TP trước khi gửi/modify phải thỏa: khoảng cách tới giá thị trường `≥ max(SYMBOL_TRADE_STOPS_LEVEL, SYMBOL_TRADE_FREEZE_LEVEL) × _Point`.
+* Sau khi clamp SL → tính lại TP, RR, lot trên khoảng SL mới; RR sau clamp `< MinRR` → hủy setup.
+* Kiểm tra `Trade.ResultRetcode()` sau mỗi lệnh; log retcode khi thất bại, không retry mù quá 2 lần.
+
+
+* Giá SL/TP phải `NormalizeDouble(..., Digits_val)`; lot floor theo `lot_step`, clamp `[lot_min, lot_max]`.
+* Tham số chiến lược **luôn qua `input**`, không hard-code magic numbers trong logic.
+* Naming: biến global prefix `g_`, struct PascalCase (`OBZone`, `CHoCHResult`, `LossZone`).
+* **Tên file chính thức:** `XAU_SMC_Trader.mq5` — mọi thay đổi logic ghi vào change-log cuối file `.mq5` và cập nhật `MEMORY.md` cùng lúc; đổi tên file phải cập nhật đồng thời Mục 1 + 2.2.

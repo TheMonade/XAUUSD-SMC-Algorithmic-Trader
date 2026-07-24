@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//|                                    XAU_SMC_Trader_Fixed.mq5      |
+//|                                    XAU_SMC_Trader.mq5            |
 //| Strategy: H1 Order Block + M5 CHoCH Entry                        |
 //| FIXED VERSION, see change-log at bottom of file                  |
 //+------------------------------------------------------------------+
@@ -55,6 +55,8 @@ double         InitialVolume    = 0.0;
 double         InitialSLDistance = 0.0;
 double         LastTrailSL      = 0.0;
 ulong          CurrentTicket    = 0;
+ENUM_ORDER_TYPE_FILLING g_FillingMode      = ORDER_FILLING_FOK;
+int                     g_FillingFallbacks = 0;
 
 int            hATR_H1;
 int            hATR_M5;
@@ -97,7 +99,10 @@ int OnInit()
 {
    Trade.SetExpertMagicNumber(MagicNumber);
    Trade.SetDeviationInPoints(30);
-   Trade.SetTypeFilling(ORDER_FILLING_RETURN);
+   
+   g_FillingMode = ResolveFillingMode(_Symbol);
+   Trade.SetTypeFilling(g_FillingMode);
+   PrintFormat("[FEAT-P0-001] Filling mode selected: %s", EnumToString(g_FillingMode));
 
    Point_val  = _Point;
    Digits_val = _Digits;
@@ -317,9 +322,9 @@ void OnTick()
 
    bool placed = false;
    if(order_type == ORDER_TYPE_BUY)
-      placed = Trade.Buy(lot, _Symbol, entry, sl_price, tp_price, "SMC Bot - BUY");
+      placed = SafeOrderSend(ORDER_TYPE_BUY, lot, entry, sl_price, tp_price, "SMC Bot - BUY");
    else
-      placed = Trade.Sell(lot, _Symbol, entry, sl_price, tp_price, "SMC Bot - SELL");
+      placed = SafeOrderSend(ORDER_TYPE_SELL, lot, entry, sl_price, tp_price, "SMC Bot - SELL");
 
    if(placed)
    {
@@ -628,7 +633,31 @@ void ManagePosition()
       if(lot_to_close >= lot_min && remaining >= lot_min)
       {
          if(Trade.PositionClosePartial(ticket, lot_to_close))
+         {
             PartialDone = true;
+         }
+         else if(Trade.ResultRetcode() == TRADE_RETCODE_INVALID_FILL)
+         {
+            if(FallbackFillingMode())
+            {
+               if(Trade.PositionClosePartial(ticket, lot_to_close))
+               {
+                  PartialDone = true;
+               }
+               else
+               {
+                  PrintFormat("[FEAT-P0-001] Retry partial close failed, retcode: %d, comment: %s", Trade.ResultRetcode(), Trade.ResultComment());
+               }
+            }
+            else
+            {
+               PrintFormat("[FEAT-P0-001] FATAL: All filling modes failed for partial close");
+            }
+         }
+         else
+         {
+            PrintFormat("[FEAT-P0-001] PositionClosePartial failed, retcode: %d, comment: %s", Trade.ResultRetcode(), Trade.ResultComment());
+         }
       }
       else
       {
@@ -688,3 +717,66 @@ double CalcLotSize(double sl_points)
    lot = MathFloor(lot / lot_step) * lot_step;
    return MathMax(lot_min, MathMin(lot_max, lot));
 }
+
+//+------------------------------------------------------------------+
+ENUM_ORDER_TYPE_FILLING ResolveFillingMode(const string symbol)
+{
+   long mask = SymbolInfoInteger(symbol, SYMBOL_FILLING_MODE);
+   long exemode = SymbolInfoInteger(symbol, SYMBOL_TRADE_EXEMODE);
+   if((mask & SYMBOL_FILLING_FOK) != 0) return ORDER_FILLING_FOK;
+   if((mask & SYMBOL_FILLING_IOC) != 0) return ORDER_FILLING_IOC;
+   if(exemode == SYMBOL_TRADE_EXECUTION_EXCHANGE || exemode == SYMBOL_TRADE_EXECUTION_REQUEST || exemode == SYMBOL_TRADE_EXECUTION_INSTANT) return ORDER_FILLING_RETURN;
+   return ORDER_FILLING_FOK;
+}
+
+//+------------------------------------------------------------------+
+bool FallbackFillingMode()
+{
+   if(g_FillingMode == ORDER_FILLING_FOK)
+      g_FillingMode = ORDER_FILLING_IOC;
+   else if(g_FillingMode == ORDER_FILLING_IOC)
+      g_FillingMode = ORDER_FILLING_RETURN;
+   else
+      return false;
+
+   g_FillingFallbacks++;
+   Trade.SetTypeFilling(g_FillingMode);
+   PrintFormat("[FEAT-P0-001] Fallback filling mode selected: %s", EnumToString(g_FillingMode));
+   return true;
+}
+
+//+------------------------------------------------------------------+
+bool SafeOrderSend(const ENUM_ORDER_TYPE type, const double lot,
+                   const double price, const double sl, const double tp,
+                   const string comment)
+{
+   int MAX_RETRY = 2;
+   for(int i = 0; i <= MAX_RETRY; i++)
+   {
+      bool placed = false;
+      if(type == ORDER_TYPE_BUY)
+         placed = Trade.Buy(lot, _Symbol, price, sl, tp, comment);
+      else
+         placed = Trade.Sell(lot, _Symbol, price, sl, tp, comment);
+
+      uint retcode = Trade.ResultRetcode();
+      if(placed && (retcode == TRADE_RETCODE_DONE || retcode == TRADE_RETCODE_PLACED))
+         return true;
+
+      if(retcode == TRADE_RETCODE_INVALID_FILL)
+      {
+         if(!FallbackFillingMode())
+         {
+            PrintFormat("[FEAT-P0-001] FATAL: All filling modes failed for retcode 10030");
+            return false;
+         }
+         continue;
+      }
+
+      PrintFormat("[FEAT-P0-001] Order failed with retcode: %d, comment: %s", retcode, Trade.ResultComment());
+      return false;
+   }
+   return false;
+}
+
+// [FEAT-P0-001] Auto Filling Mode Detection: FOK->IOC->RETURN, runtime fallback on retcode 10030
