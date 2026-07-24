@@ -28,6 +28,13 @@ input int      ATR_Period_M5    = 14;
 input double   CHoCH_Prom_Mult  = 0.5;
 input int      Peak_Distance    = 5;
 
+input group "=== LIQUIDITY SWEEP (M5) ==="
+input bool     UseSweepFilter          = true;  // bật/tắt filter sweep (A/B test)
+input double   Sweep_MinPen_ATR_Mult   = 0.05;  // độ xuyên tối thiểu = mult * ATR(M5)
+input double   Sweep_MaxPen_ATR_Mult   = 2.0;   // độ xuyên tối đa (quá sâu = breakdown)
+input int      Sweep_MaxAgeBars        = 36;    // sweep phải xảy ra trong N nến M5 gần nhất
+input double   Sweep_BodyClosePct      = 0.0;   // % thân nến tối thiểu đóng trên ref_level
+
 input group "=== POSITION MANAGEMENT (R-multiple based) ==="
 input double   PartialAtR       = 1.0;   // start partial close once profit >= 1.0 x initial risk
 input double   PartialClosePct  = 0.66;  // close 66% of volume at PartialAtR
@@ -88,10 +95,22 @@ struct OBZone
    datetime time_found;
 };
 
+// === [FEAT-P1-008] Sweep result ===
+struct SweepInfo
+{
+   bool     found;          // có sweep hợp lệ không
+   int      sweep_bar;      // index nến sweep (series, 1 = nến vừa đóng)
+   double   ref_level;      // mức thanh khoản bị quét (swing low/high cũ)
+   double   sweep_extreme;  // low của sweep candle (bullish) / high (bearish)
+   datetime sweep_time;     // thời điểm sweep (logging)
+};
+
 struct CHoCHResult
 {
    string choch_type;
    double smart_sl;
+   bool   sweep_confirmed;  // [FEAT-P1-008]
+   double sweep_level;      // [FEAT-P1-008]
 };
 
 //+------------------------------------------------------------------+
@@ -155,7 +174,6 @@ bool IsZoneBlocked(double top, double bottom)
    if(CopyBuffer(hATR_H1, 0, 0, 1, atr_h1) > 0)
       proximity = atr_h1[0] * ZoneProximityATRMult;
 
-   // Giới hạn vòng quét không vượt quá 10 phần tử
    int limit = MathMin(g_LossZoneCount, MAX_LOSS_ZONES);
 
    for(int i = 0; i < limit; i++)
@@ -339,6 +357,10 @@ void OnTick()
       g_HasOpenZone    = true;
 
       g_TradesToday++;
+
+      if(choch.sweep_confirmed)
+         PrintFormat("[FEAT-P1-008] Entry with sweep @ ref=%.*f, sweep_extreme=%.*f, bar_age=%d",
+                     Digits_val, choch.sweep_level, Digits_val, choch.smart_sl, 0); 
    }
 }
 
@@ -416,6 +438,129 @@ bool GetOB_H1(OBZone &ob)
 }
 
 //+------------------------------------------------------------------+
+//| [FEAT-P1-008] Liquidity Sweep Detection on M5                    |
+//| direction: +1 = bullish sweep, -1 = bearish sweep                |
+//| Trả về true nếu có sweep hợp lệ; fill đầy đủ struct `sweep`      |
+//+------------------------------------------------------------------+
+bool DetectLiquiditySweep_M5(const int direction,
+                             const OBZone &ob,
+                             const int trigger_peak_idx,
+                             const double &high[],
+                             const double &low[],
+                             const double &close[],
+                             const double atr_val,
+                             SweepInfo &sweep)
+{
+   sweep.found = false;
+   sweep.sweep_bar = -1;
+   sweep.ref_level = 0;
+   sweep.sweep_extreme = 0;
+   sweep.sweep_time = 0;
+
+   int window_end = MathMin(trigger_peak_idx - 1, Sweep_MaxAgeBars);
+   double prom = atr_val * CHoCH_Prom_Mult;
+
+   if(direction == 1) // Bullish
+   {
+      double ref_level = ob.bottom;
+      for(int i = trigger_peak_idx + Peak_Distance; i < CHoCH_Lookback; i++)
+      {
+         if(IsTrough(low, i, Peak_Distance, prom))
+         {
+            ref_level = low[i];
+            break;
+         }
+      }
+      sweep.ref_level = ref_level;
+
+      int deepest_bar = -1;
+      double deepest_low = DBL_MAX;
+
+      for(int i = 2; i <= window_end; i++)
+      {
+         if(i >= ArraySize(low) || i >= ArraySize(close)) continue;
+         double pen = ref_level - low[i];
+         if(pen >= atr_val * Sweep_MinPen_ATR_Mult && 
+            pen <= atr_val * Sweep_MaxPen_ATR_Mult && 
+            close[i] > ref_level)
+         {
+            if(low[i] < deepest_low)
+            {
+               deepest_low = low[i];
+               deepest_bar = i;
+            }
+         }
+      }
+
+      for(int i = 2; i <= window_end; i++)
+      {
+         if(i >= ArraySize(close)) continue;
+         if(close[i] < ref_level - atr_val * Sweep_MinPen_ATR_Mult) 
+            return false;
+      }
+
+      if(deepest_bar >= 2)
+      {
+         sweep.found = true;
+         sweep.sweep_bar = deepest_bar;
+         sweep.sweep_extreme = deepest_low;
+         sweep.sweep_time = iTime(_Symbol, PERIOD_M5, deepest_bar);
+         return true;
+      }
+   }
+   else if(direction == -1) // Bearish
+   {
+      double ref_level = ob.top;
+      for(int i = trigger_peak_idx + Peak_Distance; i < CHoCH_Lookback; i++)
+      {
+         if(IsPeak(high, i, Peak_Distance, prom))
+         {
+            ref_level = high[i];
+            break;
+         }
+      }
+      sweep.ref_level = ref_level;
+
+      int highest_bar = -1;
+      double highest_high = -DBL_MAX;
+
+      for(int i = 2; i <= window_end; i++)
+      {
+         if(i >= ArraySize(high) || i >= ArraySize(close)) continue;
+         double pen = high[i] - ref_level;
+         if(pen >= atr_val * Sweep_MinPen_ATR_Mult && 
+            pen <= atr_val * Sweep_MaxPen_ATR_Mult && 
+            close[i] < ref_level)
+         {
+            if(high[i] > highest_high)
+            {
+               highest_high = high[i];
+               highest_bar = i;
+            }
+         }
+      }
+
+      for(int i = 2; i <= window_end; i++)
+      {
+         if(i >= ArraySize(close)) continue;
+         if(close[i] > ref_level + atr_val * Sweep_MinPen_ATR_Mult) 
+            return false;
+      }
+
+      if(highest_bar >= 2)
+      {
+         sweep.found = true;
+         sweep.sweep_bar = highest_bar;
+         sweep.sweep_extreme = highest_high;
+         sweep.sweep_time = iTime(_Symbol, PERIOD_M5, highest_bar);
+         return true;
+      }
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
 bool DetectCHoCH_M5(const OBZone &ob, CHoCHResult &result)
 {
    int bars = CHoCH_Lookback + 3;
@@ -466,14 +611,30 @@ bool DetectCHoCH_M5(const OBZone &ob, CHoCHResult &result)
 
       if(close_m5[1] > last_swing_high && close_m5[2] <= last_swing_high)
       {
-         double lowest_low = low_m5[last_peak_idx];
-         for(int i = 1; i <= last_peak_idx; i++)
-            if(low_m5[i] < lowest_low) lowest_low = low_m5[i];
+         if(UseSweepFilter)
+         {
+            SweepInfo sweep;
+            if(!DetectLiquiditySweep_M5(1, ob, last_peak_idx, high_m5, low_m5, close_m5, atr_val, sweep)) 
+               return false;
+               
+            result.smart_sl = sweep.sweep_extreme;
+            result.sweep_confirmed = true;
+            result.sweep_level = sweep.ref_level;
+         }
+         else
+         {
+            double lowest_low = low_m5[last_peak_idx];
+            for(int i = 1; i <= last_peak_idx; i++)
+               if(low_m5[i] < lowest_low) lowest_low = low_m5[i];
+               
+            result.smart_sl = lowest_low;
+            result.sweep_confirmed = false;
+            result.sweep_level = 0.0;
+         }
 
-         if(lowest_low > ob.top) return false;
+         if(result.smart_sl > ob.top) return false;
 
          result.choch_type = "Bullish CHoCH";
-         result.smart_sl   = lowest_low;
          return true;
       }
    }
@@ -508,14 +669,30 @@ bool DetectCHoCH_M5(const OBZone &ob, CHoCHResult &result)
 
       if(close_m5[1] < last_swing_low && close_m5[2] >= last_swing_low)
       {
-         double highest_high = high_m5[last_trough_idx];
-         for(int i = 1; i <= last_trough_idx; i++)
-            if(high_m5[i] > highest_high) highest_high = high_m5[i];
+         if(UseSweepFilter)
+         {
+            SweepInfo sweep;
+            if(!DetectLiquiditySweep_M5(-1, ob, last_trough_idx, high_m5, low_m5, close_m5, atr_val, sweep)) 
+               return false;
+               
+            result.smart_sl = sweep.sweep_extreme;
+            result.sweep_confirmed = true;
+            result.sweep_level = sweep.ref_level;
+         }
+         else
+         {
+            double highest_high = high_m5[last_trough_idx];
+            for(int i = 1; i <= last_trough_idx; i++)
+               if(high_m5[i] > highest_high) highest_high = high_m5[i];
+               
+            result.smart_sl = highest_high;
+            result.sweep_confirmed = false;
+            result.sweep_level = 0.0;
+         }
 
-         if(highest_high < ob.bottom) return false;
+         if(result.smart_sl < ob.bottom) return false;
 
          result.choch_type = "Bearish CHoCH";
-         result.smart_sl   = highest_high;
          return true;
       }
    }
@@ -780,3 +957,9 @@ bool SafeOrderSend(const ENUM_ORDER_TYPE type, const double lot,
 }
 
 // [FEAT-P0-001] Auto Filling Mode Detection: FOK->IOC->RETURN, runtime fallback on retcode 10030
+//+------------------------------------------------------------------+
+//| CHANGE LOG                                                       |
+//| [FEAT-P1-008] 2026-07-24: Liquidity Sweep Detection , thêm input |
+//| group SWEEP, struct SweepInfo, hàm DetectLiquiditySweep_M5,      |
+//| tích hợp filter + Smart SL theo sweep_extreme vào DetectCHoCH_M5 |
+//+------------------------------------------------------------------+

@@ -82,9 +82,10 @@ project_root/
 Với OB Bullish (Bearish làm đối xứng):
 
 1. **Touch check:** Trong 100 nến M5, phải có ít nhất 1 nến có `low` chạm vùng OB (`bottom ≤ low ≤ top`).
-2. **Tìm swing high gần nhất:** `IsPeak()` — cao hơn `Peak_Distance = 5` nến 2 bên **và** prominence `≥ ATR(M5) × 0.5`.
-3. **Trigger CHoCH:** `close[1]` phá lên swing high và `close[2]` còn nằm dưới → breakout mới xảy ra (chống re-trigger).
-4. **Smart SL:** `lowest low` từ swing peak đến hiện tại; SL phải nằm trong/dưới OB (`lowest_low ≤ ob.top`).
+2. **Tìm swing high gần nhất:** `IsPeak()` , cao hơn `Peak_Distance = 5` nến 2 bên **và** prominence `≥ ATR(M5) × 0.5`.
+3. **Trigger CHoCH:** `close[1]` phá lên swing high và `close[2]` còn nằm dưới , breakout mới xảy ra (chống re-trigger).
+4. **Sweep filter:** Xác nhận nến có độ xuyên từ `0.05` đến `2.0` ATR qua `ref_level`. Khóa lệnh nếu có breakdown đóng nến hoàn toàn qua cực.
+5. **Smart SL:** Lấy `sweep_extreme` làm SL hoặc fallback về `lowest low` từ swing peak đến hiện tại, SL phải nằm trong/dưới OB (`lowest_low ≤ ob.top`).
 
 ### 3.3. Vào lệnh & Risk (trong `OnTick`)
 
@@ -149,8 +150,9 @@ Deal closed → OnTradeTransaction → cập nhật loss streak / loss zone / re
 * [x] **Position Management** — Partial close + R-based trailing
 * [x] **Overtrade Control** — daily cap, loss-streak cooldown, loss-zone blacklist
 * [x] **Execution** — CTrade với Magic, deviation 30
-* [x] **Auto Filling Mode Detection** — Hoàn thành [FEAT-P0-001]: Dùng `ResolveFillingMode()` tự động dò FOK->IOC->RETURN trong `OnInit`, bọc `SafeOrderSend` xử lý retry/fallback runtime khi gặp retcode 10030 (`TRADE_RETCODE_INVALID_FILL`), hỗ trợ fallback cả khi `PositionClosePartial` thất bại.[ ] **Stops Level Clamp** — CHƯA CÓ trong entry lẫn trailing (P0, xem 3.3.1)
-* [ ] **Liquidity Sweep Detection** — chưa có tường minh (mới ngầm định qua lowest-low sweep vào OB)
+* [x] **Auto Filling Mode Detection** — Hoàn thành [FEAT-P0-001]: Dùng `ResolveFillingMode()` tự động dò FOK->IOC->RETURN trong `OnInit`, bọc `SafeOrderSend` xử lý retry/fallback runtime khi gặp retcode 10030 (`TRADE_RETCODE_INVALID_FILL`), hỗ trợ fallback cả khi `PositionClosePartial` thất bại.
+* [ ] **Stops Level Clamp** — CHƯA CÓ trong entry lẫn trailing (P0, xem 3.3.1)
+* [x] **Liquidity Sweep Detection** , (FEAT-P1-008 , đã implement, chờ backtest T1,T5)
 * [ ] **FVG (Fair Value Gap)** — chưa có module riêng
 * [ ] **HTF Bias Filter (H4/D1)** — chưa có
 * [ ] **Session/Kill-zone Filter (London/NY)** — chỉ check symbol tradeable
