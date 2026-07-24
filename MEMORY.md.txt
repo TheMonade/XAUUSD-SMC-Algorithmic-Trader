@@ -23,7 +23,7 @@
 | Indicator | ATR H1 (period 15) & ATR M5 (period 14) qua handle `iATR` + `CopyBuffer` |
 | Symbol mục tiêu | XAUUSD (chart-attached `_Symbol`) |
 | Kiến trúc | **Monolith 1 file** — toàn bộ logic nằm trong 1 file `.mq5` |
-| Execution Mode | Hiện hard-code `ORDER_FILLING_RETURN` trong `OnInit` — **RỦI RO** với broker ECN/STP (xem 2.1) |
+| Execution Mode | Tự động dò theo bitmask broker (ResolveFillingMode), bọc qua SafeOrderSend với cơ chế fallback FOK -> IOC -> RETURN khi gặp lỗi 10030|
 
 ### 2.1. Quy tắc Execution Mode (BẮT BUỘC khi refactor)
 
@@ -149,8 +149,7 @@ Deal closed → OnTradeTransaction → cập nhật loss streak / loss zone / re
 * [x] **Position Management** — Partial close + R-based trailing
 * [x] **Overtrade Control** — daily cap, loss-streak cooldown, loss-zone blacklist
 * [x] **Execution** — CTrade với Magic, deviation 30
-* [ ] **Auto Filling Mode Detection** — CHƯA CÓ, đang hard-code `RETURN` (P0, xem 2.1)
-* [ ] **Stops Level Clamp** — CHƯA CÓ trong entry lẫn trailing (P0, xem 3.3.1)
+* [x] **Auto Filling Mode Detection** — Hoàn thành [FEAT-P0-001]: Dùng `ResolveFillingMode()` tự động dò FOK->IOC->RETURN trong `OnInit`, bọc `SafeOrderSend` xử lý retry/fallback runtime khi gặp retcode 10030 (`TRADE_RETCODE_INVALID_FILL`), hỗ trợ fallback cả khi `PositionClosePartial` thất bại.[ ] **Stops Level Clamp** — CHƯA CÓ trong entry lẫn trailing (P0, xem 3.3.1)
 * [ ] **Liquidity Sweep Detection** — chưa có tường minh (mới ngầm định qua lowest-low sweep vào OB)
 * [ ] **FVG (Fair Value Gap)** — chưa có module riêng
 * [ ] **HTF Bias Filter (H4/D1)** — chưa có
@@ -165,8 +164,6 @@ Deal closed → OnTradeTransaction → cập nhật loss streak / loss zone / re
 ### Ưu tiên khẩn cấp (P0 — lỗi execution thực chiến)
 
 1. **Auto-detect Filling Mode** theo `SYMBOL_FILLING_MODE` (FOK → IOC → RETURN) trong `OnInit` — chống lỗi reject lệnh trên broker ECN/STP (chi tiết 2.1).
-2. **Clamp SL/TP theo `SYMBOL_TRADE_STOPS_LEVEL` + `FREEZE_LEVEL**` ở cả entry và trailing; tính lại RR/lot sau clamp (chi tiết 3.3.1).
-3. **Persist state khi restart:** Lưu `g_LossZones`, `g_TradesToday`, `g_ConsecutiveLosses`, `InitialSLDistance` vào GlobalVariables/file — hiện restart giữa lệnh làm sai `InitialSLDistance` (fallback từ SL đã trail).
 
 ### Ưu tiên cao (P1)
 
